@@ -53,7 +53,7 @@ Options:
   -a <agent_user>    Agent account name to manage (default: $AGENT_USER)
   -b <work_root>     Managed work root (default: $BASE_ROOT); tool state lives in <work_root>/<tool>
   -t <tool>          Runtime tool to execute (default: $TOOL_NAME)
-  -i <tool>          Install a supported tool into /opt/<tool> (only: codex)
+  -i <tool>          Install a supported tool into /opt/<tool> (supported: codex, claude)
   -e <session_id>    Resume a prior interactive session by invoking <tool> resume <session_id>
   -n                 Prepare only; do not expose source or run the tool
   -r                 Reset interactively: unmount, purge the selected tool state, remove managed users
@@ -62,6 +62,7 @@ Options:
 
 Examples:
   sudo $0 -i codex
+  sudo $0 -i claude
   sudo $0 -s /home/alice/projects/repo -t codex
   sudo $0 -s /home/alice/projects/repo -t codex -e 019d86eb-446f-7361-956b-aac6c08e5163
   sudo $0 -d
@@ -137,7 +138,7 @@ save_config() {
 
 supported_install_target() {
   case "$1" in
-    codex) return 0 ;;
+    codex|claude) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -163,9 +164,47 @@ install_tool() {
       chmod -R a+rX "$install_prefix"
       chmod -R go-w "$install_prefix"
       ;;
+    claude)
+      require_cmd npm
+      require_cmd node
+      install_prefix="$(tool_prefix_for "$1")"
+      npm install -g --prefix="$install_prefix" @anthropic-ai/claude-code
+      chown -R root:root "$install_prefix"
+      chmod -R a+rX "$install_prefix"
+      chmod -R go-w "$install_prefix"
+      ;;
     *)
       echo "Unsupported install target: $1" >&2
       exit 2
+      ;;
+  esac
+}
+
+run_managed_tool() {
+  local runtime_bin="$1"
+  local workdir="$2"
+
+  case "$TOOL_NAME" in
+    codex)
+      if [[ -n "$RESUME_SESSION" ]]; then
+        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2" resume "$3"' -- "$workdir" "$runtime_bin" "$RESUME_SESSION"
+      else
+        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$workdir" "$runtime_bin"
+      fi
+      ;;
+    claude)
+      if [[ -n "$RESUME_SESSION" ]]; then
+        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2" -r "$3"' -- "$workdir" "$runtime_bin" "$RESUME_SESSION"
+      else
+        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$workdir" "$runtime_bin"
+      fi
+      ;;
+    *)
+      if [[ -n "$RESUME_SESSION" ]]; then
+        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2" resume "$3"' -- "$workdir" "$runtime_bin" "$RESUME_SESSION"
+      else
+        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$workdir" "$runtime_bin"
+      fi
       ;;
   esac
 }
@@ -685,8 +724,4 @@ setfacl -R -m "d:u:${AGENT_USER}:rwX,d:u:${MAIN_USER}:rwX" "$SOURCE_DIR"
 
 RUNTIME_BIN="$(tool_runtime_bin)"
 ensure_agent_can_traverse "$MOUNTPOINT_DIR"
-if [[ -n "$RESUME_SESSION" ]]; then
-  sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2" resume "$3"' -- "$MOUNTPOINT_DIR" "$RUNTIME_BIN" "$RESUME_SESSION"
-else
-  sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$MOUNTPOINT_DIR" "$RUNTIME_BIN"
-fi
+run_managed_tool "$RUNTIME_BIN" "$MOUNTPOINT_DIR"

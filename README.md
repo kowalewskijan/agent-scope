@@ -15,7 +15,7 @@ Required system tools:
 - user/group tools: `id`, `getent`, `groupadd`, `groupdel`, `useradd`, `userdel`, `passwd`, `gpasswd`
 - filesystem tools: `mkdir`, `mktemp`, `chmod`, `chown`, `ln`, `mv`, `rm`, `rmdir`, `find`, `sha256sum`, `sort`
 
-For `-i codex` installation:
+For tool installation via `-i`:
 
 - `node`
 - `npm`
@@ -34,10 +34,22 @@ Install Codex into `/opt/codex`:
 sudo ./agent_scope -i codex
 ```
 
+Install Claude Code into `/opt/claude`:
+
+```bash
+sudo ./agent_scope -i claude
+```
+
 Run Codex on a source tree:
 
 ```bash
 sudo ./agent_scope -s /home/alice/projects/repo -t codex
+```
+
+Run Claude Code on a source tree:
+
+```bash
+sudo ./agent_scope -s /home/alice/projects/repo -t claude
 ```
 
 Resume a previous session through `agent_scope`:
