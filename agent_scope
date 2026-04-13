@@ -1,0 +1,692 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agent_scope
+#
+# Provision and run an unprivileged "agent" account against exactly one source
+# directory at a time. The source directory is bind-mounted into a managed base
+# directory using a path-derived mount name. Temporary ACLs are granted only for
+# the session and restored on exit.
+#
+# Notes:
+# - This is not a full sandbox. The agent still runs on the host root filesystem
+#   as a normal unprivileged user.
+# - Managed state lives under /srv/work/<tool> by default.
+# - Installation support is currently implemented for the "codex" tool.
+# - Runtime tool selection via -t is generic and falls back to PATH if needed.
+
+MAIN_USER="${USER:-user}"
+AGENT_USER="agent"
+BASE_ROOT="/srv/work"
+TOOL_NAME="codex"
+INSTALL_TARGET=""
+SOURCE_DIR=""
+NO_RUN="false"
+RESET_STATE="false"
+DISCONNECT_MOUNT="false"
+AGENT_CREATED_BY_SCRIPT="false"
+
+CLI_MAIN_USER=""
+CLI_AGENT_USER=""
+CLI_BASE_ROOT=""
+CLI_TOOL_NAME=""
+CLI_INSTALL_TARGET=""
+CLI_SOURCE_DIR=""
+CLI_RESUME_SESSION=""
+
+BASE_DIR=""
+CONFIG_DIR=""
+CONFIG_FILE=""
+ACL_BACKUP=""
+MOUNTPOINT_DIR=""
+AGENT_HOME=""
+RESUME_SESSION=""
+REUSE_EXISTING_MOUNT="false"
+
+usage() {
+  cat <<EOF
+Usage: sudo $0 [options]
+
+Options:
+  -s <source_dir>    Source directory to expose and run the managed tool in
+  -u <main_user>     Main user who should retain access (default: \$USER)
+  -a <agent_user>    Agent account name to manage (default: $AGENT_USER)
+  -b <work_root>     Managed work root (default: $BASE_ROOT); tool state lives in <work_root>/<tool>
+  -t <tool>          Runtime tool to execute (default: $TOOL_NAME)
+  -i <tool>          Install a supported tool into /opt/<tool> (only: codex)
+  -e <session_id>    Resume a prior interactive session by invoking <tool> resume <session_id>
+  -n                 Prepare only; do not expose source or run the tool
+  -r                 Reset interactively: unmount, purge the selected tool state, remove managed users
+  -d                 Interactively select and unmount one current bind mount under <work_root>
+  -h                 Help
+
+Examples:
+  sudo $0 -i codex
+  sudo $0 -s /home/alice/projects/repo -t codex
+  sudo $0 -s /home/alice/projects/repo -t codex -e 019d86eb-446f-7361-956b-aac6c08e5163
+  sudo $0 -d
+  sudo $0 -b /srv/work -t codex -r
+EOF
+}
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
+
+normalize_path() {
+  local path="$1"
+  local mode="${2:-m}"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "-$mode" -- "$path"
+    return
+  fi
+
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) echo "Path must be absolute without realpath: $path" >&2; exit 2 ;;
+  esac
+}
+
+user_home() {
+  local passwd_entry user home
+
+  passwd_entry="$(getent passwd "$1")" || {
+    echo "User '$1' not found" >&2
+    exit 1
+  }
+
+  IFS=: read -r user _ _ _ _ home _ <<<"$passwd_entry"
+  printf '%s\n' "$home"
+}
+
+config_value_is_safe() {
+  [[ "$1" != *$'\n'* && "$1" != *$'\t'* ]]
+}
+
+load_config() {
+  local key value
+
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  while IFS=$'\t' read -r key value; do
+    [[ -n "$key" ]] || continue
+
+    case "$key" in
+      agent_user) AGENT_USER="$value" ;;
+      agent_created_by_script) AGENT_CREATED_BY_SCRIPT="$value" ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+save_config() {
+  local tmp_config
+
+  config_value_is_safe "$AGENT_USER" || { echo "Unsafe config value for agent_user" >&2; exit 1; }
+
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+
+  tmp_config="$(mktemp "$CONFIG_DIR/agent_scope.conf.XXXXXX")"
+  {
+    printf 'agent_user\t%s\n' "$AGENT_USER"
+    printf 'agent_created_by_script\t%s\n' "$AGENT_CREATED_BY_SCRIPT"
+  } >"$tmp_config"
+
+  chmod 600 "$tmp_config"
+  mv -f "$tmp_config" "$CONFIG_FILE"
+}
+
+supported_install_target() {
+  case "$1" in
+    codex) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+tool_name_is_safe() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+tool_prefix_for() {
+  printf '/opt/%s\n' "$1"
+}
+
+install_tool() {
+  local install_prefix
+
+  case "$1" in
+    codex)
+      require_cmd npm
+      require_cmd node
+      install_prefix="$(tool_prefix_for "$1")"
+      npm install -g --prefix="$install_prefix" @openai/codex
+      chown -R root:root "$install_prefix"
+      chmod -R a+rX "$install_prefix"
+      chmod -R go-w "$install_prefix"
+      ;;
+    *)
+      echo "Unsupported install target: $1" >&2
+      exit 2
+      ;;
+  esac
+}
+
+tool_prefix_bin() {
+  printf '%s/bin/%s\n' "$TOOL_PREFIX" "$TOOL_NAME"
+}
+
+tool_runtime_bin() {
+  local prefix_bin
+  local override_bin="${AGENT_SCOPE_RUNTIME_BIN:-}"
+
+  if [[ -n "$override_bin" ]]; then
+    [[ -x "$override_bin" ]] || {
+      echo "AGENT_SCOPE_RUNTIME_BIN is not executable: $override_bin" >&2
+      exit 1
+    }
+    normalize_path "$override_bin" e
+    return 0
+  fi
+
+  prefix_bin="$(tool_prefix_bin)"
+  if [[ -x "$prefix_bin" ]]; then
+    printf '%s\n' "$prefix_bin"
+    return 0
+  fi
+
+  command -v "$TOOL_NAME" || {
+    echo "Managed tool '$TOOL_NAME' is not installed or not in PATH" >&2
+    exit 1
+  }
+}
+
+ensure_tool_symlink() {
+  local prefix_bin symlink_path
+
+  prefix_bin="$(tool_prefix_for "$1")/bin/$1"
+  [[ -x "$prefix_bin" ]] || return 0
+
+  symlink_path="/usr/local/bin/$1"
+  if [[ -e "$symlink_path" && ! -L "$symlink_path" ]]; then
+    echo "Refusing to replace non-symlink $symlink_path" >&2
+    return 0
+  fi
+
+  ln -sfn "$prefix_bin" "$symlink_path"
+}
+
+ensure_agent_can_traverse() {
+  local path="$1"
+
+  if ! sudo -H -u "$AGENT_USER" test -x "$path"; then
+    echo "Agent user '$AGENT_USER' cannot traverse $path" >&2
+    echo "Ensure the parent directories of the managed base are searchable by that user." >&2
+    exit 1
+  fi
+}
+
+cleanup() {
+  local status=$?
+
+  trap - EXIT
+
+  if [[ -n "$ACL_BACKUP" && -f "$ACL_BACKUP" && -d "${SOURCE_DIR:-}" ]]; then
+    restore_acl_state "$ACL_BACKUP" "$SOURCE_DIR" || echo "Warning: failed to restore ACLs for $SOURCE_DIR" >&2
+    rm -f "$ACL_BACKUP"
+  fi
+
+  exit "$status"
+}
+
+strip_temporary_acl_entries() {
+  local path="$1"
+
+  setfacl -x "u:${AGENT_USER}" "$path" >/dev/null 2>&1 || true
+  setfacl -x "u:${MAIN_USER}" "$path" >/dev/null 2>&1 || true
+
+  if [[ -d "$path" ]]; then
+    setfacl -x "d:u:${AGENT_USER}" "$path" >/dev/null 2>&1 || true
+    setfacl -x "d:u:${MAIN_USER}" "$path" >/dev/null 2>&1 || true
+  fi
+}
+
+restore_acl_state() {
+  local backup_file="$1"
+  local root="$2"
+  local line path
+  local restore_status=0
+  declare -A backed_up_paths=()
+
+  while IFS= read -r line; do
+    case "$line" in
+      \#\ file:\ *) backed_up_paths["${line#\# file: }"]=1 ;;
+    esac
+  done <"$backup_file"
+
+  setfacl --restore="$backup_file" || restore_status=$?
+
+  while IFS= read -r path; do
+    [[ -n "${backed_up_paths["$path"]+x}" ]] && continue
+    strip_temporary_acl_entries "$path"
+  done < <(find "$root" -print)
+
+  return "$restore_status"
+}
+
+collect_mount_targets() {
+  local root="$1"
+  local order="${2:-asc}"
+  local dir
+
+  COLLECTED_MOUNT_TARGETS=()
+  [[ -d "$root" ]] || return 0
+
+  if [[ "$order" == "desc" ]]; then
+    while IFS= read -r dir; do
+      mountpoint -q "$dir" 2>/dev/null || continue
+      COLLECTED_MOUNT_TARGETS+=("$dir")
+    done < <(find "$root" -mindepth 1 -type d | sort -r)
+    return 0
+  fi
+
+  while IFS= read -r dir; do
+    mountpoint -q "$dir" 2>/dev/null || continue
+    COLLECTED_MOUNT_TARGETS+=("$dir")
+  done < <(find "$root" -mindepth 1 -type d | sort)
+}
+
+load_bound_mounts() {
+  local root="$1"
+  local target source
+
+  BOUND_TARGETS=()
+  BOUND_SOURCES=()
+
+  collect_mount_targets "$root" asc
+  for target in "${COLLECTED_MOUNT_TARGETS[@]}"; do
+    source="$(findmnt -n -o SOURCE --target "$target" 2>/dev/null || true)"
+    BOUND_TARGETS+=("$target")
+    BOUND_SOURCES+=("$source")
+  done
+}
+
+disconnect_mount_interactive() {
+  local selection=0
+  local key seq target
+
+  [[ -t 0 && -t 1 ]] || {
+    echo "Option -d requires an interactive terminal" >&2
+    exit 1
+  }
+
+  load_bound_mounts "$BASE_ROOT"
+  if ((${#BOUND_TARGETS[@]} == 0)); then
+    echo "No managed bind mounts found under $BASE_ROOT"
+    exit 0
+  fi
+
+  while true; do
+    printf '\033[H\033[J'
+    printf 'Managed bind mounts under %s\n' "$BASE_ROOT"
+    printf 'Use arrow keys to choose, Enter to unmount, Esc to exit.\n\n'
+
+    for i in "${!BOUND_TARGETS[@]}"; do
+      if [[ "$i" -eq "$selection" ]]; then
+        printf '> %s <- %s\n' "${BOUND_TARGETS[$i]}" "${BOUND_SOURCES[$i]}"
+      else
+        printf '  %s <- %s\n' "${BOUND_TARGETS[$i]}" "${BOUND_SOURCES[$i]}"
+      fi
+    done
+
+    IFS= read -rsn1 key
+    case "$key" in
+      $'\x1b')
+        if IFS= read -rsn1 -t 0.05 seq && [[ "$seq" == "[" ]]; then
+          IFS= read -rsn1 seq
+          case "$seq" in
+            A) ((selection > 0)) && ((selection--)) ;;
+            B) ((selection < ${#BOUND_TARGETS[@]} - 1)) && ((selection++)) ;;
+          esac
+        else
+          printf '\033[H\033[J'
+          exit 0
+        fi
+        ;;
+      "")
+        target="${BOUND_TARGETS[$selection]}"
+        umount "$target"
+        rmdir "$target" >/dev/null 2>&1 || true
+        printf '\033[H\033[J'
+        printf 'Unmounted %s\n' "$target"
+        exit 0
+        ;;
+    esac
+  done
+}
+
+choose_existing_mount_for_resume() {
+  load_bound_mounts "$BASE_DIR"
+
+  case "${#BOUND_TARGETS[@]}" in
+    0)
+      echo "No managed bind mounts found under $BASE_DIR; pass -s <source_dir> to identify one" >&2
+      exit 1
+      ;;
+    1)
+      MOUNTPOINT_DIR="${BOUND_TARGETS[0]}"
+      SOURCE_DIR="$MOUNTPOINT_DIR"
+      REUSE_EXISTING_MOUNT="true"
+      ;;
+    *)
+      echo "Multiple managed bind mounts found under $BASE_DIR; pass -s <source_dir> to choose one" >&2
+      exit 2
+      ;;
+  esac
+}
+
+paths_share_identity() {
+  local left="$1"
+  local right="$2"
+  local left_id right_id
+
+  left_id="$(stat -Lc '%d:%i' -- "$left" 2>/dev/null || true)"
+  right_id="$(stat -Lc '%d:%i' -- "$right" 2>/dev/null || true)"
+  [[ -n "$left_id" && "$left_id" == "$right_id" ]]
+}
+
+purge_state() {
+  local answer
+  local -a mount_targets=()
+  local -a remaining_mounts=()
+  local -a directories=()
+  local -a users=()
+  local -a groups=()
+  local target
+
+  if [[ -d "$BASE_DIR" ]]; then
+    collect_mount_targets "$BASE_DIR" desc
+    for target in "${COLLECTED_MOUNT_TARGETS[@]}"; do
+      mount_targets+=("$target")
+    done
+    directories+=("$BASE_DIR")
+  fi
+
+  if [[ "$AGENT_CREATED_BY_SCRIPT" == "true" ]] && id -u "$AGENT_USER" >/dev/null 2>&1; then
+    users+=("$AGENT_USER")
+  fi
+
+  if [[ "$AGENT_CREATED_BY_SCRIPT" == "true" ]] && getent group "$AGENT_USER" >/dev/null 2>&1; then
+    groups+=("$AGENT_USER")
+  fi
+
+  printf 'Reset summary:\n'
+  if ((${#mount_targets[@]} > 0)); then
+    printf '  Mounted paths to unmount:\n'
+    printf '    %s\n' "${mount_targets[@]}"
+  else
+    printf '  Mounted paths to unmount: none\n'
+  fi
+
+  if ((${#directories[@]} > 0)); then
+    printf '  Directories to remove:\n'
+    printf '    %s\n' "${directories[@]}"
+  else
+    printf '  Directories to remove: none\n'
+  fi
+
+  if ((${#users[@]} > 0)); then
+    printf '  Users to delete:\n'
+    printf '    %s\n' "${users[@]}"
+  else
+    printf '  Users to delete: none\n'
+  fi
+
+  if ((${#groups[@]} > 0)); then
+    printf '  Groups to delete:\n'
+    printf '    %s\n' "${groups[@]}"
+  else
+    printf '  Groups to delete: none\n'
+  fi
+
+  read -r -p "Continue? [y/N] " answer
+  case "$answer" in
+    y|Y) ;;
+    *) echo "Aborted."; exit 0 ;;
+  esac
+
+  if ((${#mount_targets[@]} > 0)); then
+    for target in "${mount_targets[@]}"; do
+      umount "$target"
+    done
+  fi
+
+  if [[ -d "$BASE_DIR" ]]; then
+    if mountpoint -q "$BASE_DIR" 2>/dev/null; then
+      remaining_mounts+=("$BASE_DIR")
+    fi
+
+    collect_mount_targets "$BASE_DIR" desc
+    for target in "${COLLECTED_MOUNT_TARGETS[@]}"; do
+      remaining_mounts+=("$target")
+    done
+
+    if ((${#remaining_mounts[@]} > 0)); then
+      printf 'Refusing to remove %s because mounts still exist:\n' "$BASE_DIR" >&2
+      printf '  %s\n' "${remaining_mounts[@]}" >&2
+      exit 1
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+      rm -f -- "$CONFIG_FILE"
+    fi
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+      rmdir "$CONFIG_DIR" >/dev/null 2>&1 || true
+    fi
+
+    find "$BASE_DIR" -mindepth 1 -depth -type d -empty -exec rmdir -- '{}' + >/dev/null 2>&1 || true
+
+    rmdir "$BASE_DIR" >/dev/null 2>&1 || {
+      echo "Refusing to remove $BASE_DIR because it is not empty after unmounting." >&2
+      echo "Remove remaining managed files there manually if that is intended." >&2
+      exit 1
+    }
+  fi
+
+  if [[ "$AGENT_CREATED_BY_SCRIPT" == "true" ]] && id -u "$AGENT_USER" >/dev/null 2>&1; then
+    userdel -r "$AGENT_USER" >/dev/null 2>&1 || {
+      echo "Failed to remove managed user '$AGENT_USER'" >&2
+      exit 1
+    }
+  fi
+
+  if [[ "$AGENT_CREATED_BY_SCRIPT" == "true" ]] && getent group "$AGENT_USER" >/dev/null 2>&1; then
+    groupdel "$AGENT_USER" >/dev/null 2>&1 || true
+  fi
+}
+
+while getopts ":s:u:a:b:t:i:e:nrdh" opt; do
+  case "$opt" in
+    s) CLI_SOURCE_DIR="$OPTARG" ;;
+    u) CLI_MAIN_USER="$OPTARG" ;;
+    a) CLI_AGENT_USER="$OPTARG" ;;
+    b) CLI_BASE_ROOT="$OPTARG" ;;
+    t) CLI_TOOL_NAME="$OPTARG" ;;
+    i) CLI_INSTALL_TARGET="$OPTARG" ;;
+    e) CLI_RESUME_SESSION="$OPTARG" ;;
+    n) NO_RUN="true" ;;
+    r) RESET_STATE="true" ;;
+    d) DISCONNECT_MOUNT="true" ;;
+    h) usage; exit 0 ;;
+    \?) echo "Unknown option -$OPTARG" >&2; usage; exit 2 ;;
+    :)  echo "Option -$OPTARG requires an argument" >&2; usage; exit 2 ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0 ...)" >&2; exit 1; }
+
+require_cmd id
+require_cmd getent
+require_cmd groupadd
+require_cmd groupdel
+require_cmd useradd
+require_cmd userdel
+require_cmd passwd
+require_cmd gpasswd
+require_cmd mkdir
+require_cmd mktemp
+require_cmd chmod
+require_cmd chown
+require_cmd getfacl
+require_cmd setfacl
+require_cmd sudo
+require_cmd ln
+require_cmd mv
+require_cmd rm
+require_cmd rmdir
+require_cmd find
+require_cmd /bin/bash
+require_cmd mount
+require_cmd mountpoint
+require_cmd findmnt
+require_cmd umount
+require_cmd sha256sum
+require_cmd sort
+
+if [[ -n "$CLI_BASE_ROOT" ]]; then
+  BASE_ROOT="$CLI_BASE_ROOT"
+fi
+[[ -n "$CLI_TOOL_NAME" ]] && TOOL_NAME="$CLI_TOOL_NAME"
+
+tool_name_is_safe "$TOOL_NAME" || { echo "Unsafe tool name: $TOOL_NAME" >&2; exit 2; }
+
+BASE_ROOT="$(normalize_path "$BASE_ROOT" m)"
+BASE_DIR="$BASE_ROOT/$TOOL_NAME"
+CONFIG_DIR="$BASE_DIR/.config"
+CONFIG_FILE="$CONFIG_DIR/agent_scope.conf"
+
+load_config
+
+[[ -n "$CLI_MAIN_USER" ]] && MAIN_USER="$CLI_MAIN_USER"
+[[ -n "$CLI_AGENT_USER" ]] && AGENT_USER="$CLI_AGENT_USER"
+[[ -n "$CLI_SOURCE_DIR" ]] && SOURCE_DIR="$CLI_SOURCE_DIR"
+[[ -n "$CLI_RESUME_SESSION" ]] && RESUME_SESSION="$CLI_RESUME_SESSION"
+if [[ -n "$CLI_INSTALL_TARGET" ]]; then
+  INSTALL_TARGET="$CLI_INSTALL_TARGET"
+fi
+
+if [[ -n "$SOURCE_DIR" ]]; then
+  [[ -d "$SOURCE_DIR" ]] || { echo "Source directory not found: $SOURCE_DIR" >&2; exit 1; }
+  SOURCE_DIR="$(normalize_path "$SOURCE_DIR" e)"
+fi
+
+if [[ -n "$INSTALL_TARGET" ]] && ! tool_name_is_safe "$INSTALL_TARGET"; then
+  echo "Unsafe install target: $INSTALL_TARGET" >&2
+  exit 2
+fi
+
+if [[ -n "$INSTALL_TARGET" ]] && ! supported_install_target "$INSTALL_TARGET"; then
+  echo "Unsupported install target: $INSTALL_TARGET" >&2
+  exit 2
+fi
+
+if [[ "$DISCONNECT_MOUNT" == "true" ]]; then
+  disconnect_mount_interactive
+  exit 0
+fi
+
+if [[ "$RESET_STATE" == "true" ]]; then
+  purge_state
+  exit 0
+fi
+
+TOOL_PREFIX="$(normalize_path "$(tool_prefix_for "$TOOL_NAME")" m)"
+
+id -u "$MAIN_USER" >/dev/null 2>&1 || { echo "Main user '$MAIN_USER' not found" >&2; exit 1; }
+
+if ! getent group "$AGENT_USER" >/dev/null 2>&1; then
+  groupadd "$AGENT_USER"
+fi
+
+if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash -g "$AGENT_USER" "$AGENT_USER"
+  passwd -l "$AGENT_USER" >/dev/null 2>&1 || true
+  AGENT_CREATED_BY_SCRIPT="true"
+fi
+
+AGENT_HOME="$(user_home "$AGENT_USER")"
+if [[ -d "$AGENT_HOME" ]]; then
+  chown "$AGENT_USER:$AGENT_USER" "$AGENT_HOME"
+  chmod 700 "$AGENT_HOME"
+fi
+
+gpasswd -d "$AGENT_USER" sudo >/dev/null 2>&1 || true
+gpasswd -d "$AGENT_USER" wheel >/dev/null 2>&1 || true
+
+mkdir -p "$BASE_DIR"
+chmod 755 "$BASE_DIR"
+save_config
+
+if [[ -n "$INSTALL_TARGET" ]]; then
+  install_tool "$INSTALL_TARGET"
+  ensure_tool_symlink "$INSTALL_TARGET"
+  save_config
+elif tool_name_is_safe "$TOOL_NAME"; then
+  ensure_tool_symlink "$TOOL_NAME"
+fi
+
+if [[ -z "$SOURCE_DIR" || "$NO_RUN" == "true" ]]; then
+  if [[ -n "$RESUME_SESSION" && "$NO_RUN" != "true" ]]; then
+    choose_existing_mount_for_resume
+  else
+    exit 0
+  fi
+fi
+
+if [[ "$REUSE_EXISTING_MOUNT" != "true" ]]; then
+  case "$SOURCE_DIR/" in
+    "$BASE_ROOT/"*) echo "Source directory must not live inside the managed work root" >&2; exit 2 ;;
+  esac
+fi
+
+trap cleanup EXIT
+
+if [[ "$REUSE_EXISTING_MOUNT" != "true" ]]; then
+  NAME="$(basename -- "$SOURCE_DIR")"
+  read -r SOURCE_HASH _ <<<"$(printf '%s' "$SOURCE_DIR" | sha256sum)"
+  SOURCE_HASH="${SOURCE_HASH:0:12}"
+  MOUNTPOINT_DIR="$BASE_DIR/$NAME-$SOURCE_HASH"
+fi
+
+if [[ -e "$MOUNTPOINT_DIR" && ! -d "$MOUNTPOINT_DIR" ]]; then
+  echo "Mountpoint path exists and is not a directory: $MOUNTPOINT_DIR" >&2
+  exit 1
+fi
+
+if mountpoint -q "$MOUNTPOINT_DIR" 2>/dev/null; then
+  if ! paths_share_identity "$MOUNTPOINT_DIR" "$SOURCE_DIR"; then
+    CURRENT_SOURCE="$(findmnt -n -o SOURCE --target "$MOUNTPOINT_DIR" || true)"
+    echo "Mountpoint $MOUNTPOINT_DIR is already bound to $CURRENT_SOURCE, expected $SOURCE_DIR" >&2
+    exit 1
+  fi
+elif [[ "$REUSE_EXISTING_MOUNT" != "true" ]]; then
+  mkdir -p "$MOUNTPOINT_DIR"
+  chmod 755 "$MOUNTPOINT_DIR"
+  mount --bind "$SOURCE_DIR" "$MOUNTPOINT_DIR"
+else
+  echo "Expected existing managed mountpoint not found: $MOUNTPOINT_DIR" >&2
+  exit 1
+fi
+
+ACL_BACKUP="$(mktemp /tmp/agent_scope.acl.XXXXXX)"
+getfacl -R -p "$SOURCE_DIR" >"$ACL_BACKUP"
+
+setfacl -R -m "u:${AGENT_USER}:rwX,u:${MAIN_USER}:rwX" "$SOURCE_DIR"
+setfacl -R -m "d:u:${AGENT_USER}:rwX,d:u:${MAIN_USER}:rwX" "$SOURCE_DIR"
+
+RUNTIME_BIN="$(tool_runtime_bin)"
+ensure_agent_can_traverse "$MOUNTPOINT_DIR"
+if [[ -n "$RESUME_SESSION" ]]; then
+  sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2" resume "$3"' -- "$MOUNTPOINT_DIR" "$RUNTIME_BIN" "$RESUME_SESSION"
+else
+  sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$MOUNTPOINT_DIR" "$RUNTIME_BIN"
+fi

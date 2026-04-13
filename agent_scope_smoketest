@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Manual smoke test for agent_scope.
+#
+# This validates the script's current security model:
+# - the managed tool runs as a non-root agent user
+# - simple privilege escalation paths are denied
+# - writes to protected host paths are denied
+# - access granted to the source tree is removed after the session ends
+#
+# It does not prove full containment. The agent still runs on the host as a
+# normal unprivileged user and can read whatever the host already exposes to
+# such a user.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_SCOPE_SCRIPT="$SCRIPT_DIR/agent_scope"
+
+MAIN_USER="${SUDO_USER:-}"
+AGENT_USER="agsmoke$$"
+KEEP_ARTIFACTS="false"
+WORK_ROOT=""
+BASE_ROOT=""
+TOOL_BIN_DIR=""
+SOURCE_DIR=""
+PRIVATE_DIR=""
+RESULTS_FILE=""
+MAIN_GROUP=""
+MOUNTPOINT_DIR=""
+
+usage() {
+  cat <<EOF
+Usage: sudo $0 [-u main_user] [-a agent_user] [-k]
+
+Options:
+  -u <main_user>   Main user to retain access to the test repo
+  -a <agent_user>  Agent account to create for the smoke test
+  -k               Keep temporary artifacts instead of cleaning them up
+  -h               Help
+
+Notes:
+  - Run this as root.
+  - If -u is omitted, the script uses \$SUDO_USER.
+EOF
+}
+
+cleanup() {
+  local status=$?
+
+  if [[ "$KEEP_ARTIFACTS" != "true" && -n "$BASE_ROOT" && -x "$AGENT_SCOPE_SCRIPT" ]]; then
+    printf 'y\n' | "$AGENT_SCOPE_SCRIPT" -b "$BASE_ROOT" -t codex -r >/dev/null 2>&1 || true
+  fi
+
+  if [[ "$KEEP_ARTIFACTS" != "true" && -n "$WORK_ROOT" && -d "$WORK_ROOT" ]]; then
+    rm -rf -- "$WORK_ROOT"
+  fi
+
+  exit "$status"
+}
+
+while getopts ":u:a:kh" opt; do
+  case "$opt" in
+    u) MAIN_USER="$OPTARG" ;;
+    a) AGENT_USER="$OPTARG" ;;
+    k) KEEP_ARTIFACTS="true" ;;
+    h) usage; exit 0 ;;
+    \?) echo "Unknown option -$OPTARG" >&2; usage; exit 2 ;;
+    :)  echo "Option -$OPTARG requires an argument" >&2; usage; exit 2 ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0 ...)" >&2; exit 1; }
+[[ -x "$AGENT_SCOPE_SCRIPT" ]] || { echo "agent_scope script not found at $AGENT_SCOPE_SCRIPT" >&2; exit 1; }
+[[ -n "$MAIN_USER" && "$MAIN_USER" != "root" ]] || { echo "Pass -u <main_user> or run via sudo so \$SUDO_USER is available" >&2; exit 2; }
+
+id -u "$MAIN_USER" >/dev/null 2>&1 || { echo "Main user '$MAIN_USER' not found" >&2; exit 1; }
+MAIN_GROUP="$(id -gn "$MAIN_USER")"
+command -v getfacl >/dev/null 2>&1 || { echo "Missing command: getfacl" >&2; exit 1; }
+command -v findmnt >/dev/null 2>&1 || { echo "Missing command: findmnt" >&2; exit 1; }
+
+trap cleanup EXIT
+
+WORK_ROOT="$(mktemp -d /tmp/agent_scope_smoke.XXXXXX)"
+chmod 755 "$WORK_ROOT"
+BASE_ROOT="$WORK_ROOT/base"
+TOOL_BIN_DIR="$WORK_ROOT/tool-bin"
+SOURCE_DIR="$WORK_ROOT/repo"
+PRIVATE_DIR="$WORK_ROOT/private"
+RESULTS_FILE="$SOURCE_DIR/.agent_scope_smoke_results"
+
+mkdir -p "$TOOL_BIN_DIR" "$SOURCE_DIR" "$PRIVATE_DIR"
+chown "$MAIN_USER:$MAIN_GROUP" "$SOURCE_DIR" "$PRIVATE_DIR"
+chmod 700 "$SOURCE_DIR" "$PRIVATE_DIR"
+
+cat >"$TOOL_BIN_DIR/codex" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+RESULTS_FILE='.agent_scope_smoke_results'
+PRIVATE_DIR=$(printf '%q' "$PRIVATE_DIR")
+
+pass() { printf 'PASS\t%s\n' "\$1" >> "\$RESULTS_FILE"; }
+fail() { printf 'FAIL\t%s\n' "\$1" >> "\$RESULTS_FILE"; exit 1; }
+
+run_pass() {
+  "\$@" >/dev/null 2>&1 || fail "\$*"
+  pass "\$*"
+}
+
+run_fail() {
+  if "\$@" >/dev/null 2>&1; then
+    fail "unexpected success: \$*"
+  fi
+  pass "denied: \$*"
+}
+
+[[ "\$(id -u)" -ne 0 ]] || fail 'agent is running as root'
+pass 'agent is not root'
+
+groups="\$(id -nG)"
+[[ " \$groups " != *" sudo "* ]] || fail 'agent is in sudo group'
+[[ " \$groups " != *" wheel "* ]] || fail 'agent is in wheel group'
+pass 'agent is not in sudo or wheel'
+
+if command -v sudo >/dev/null 2>&1; then
+  run_fail sudo -n true
+else
+  pass 'sudo is not installed for the agent session'
+fi
+
+run_pass touch .write_ok
+run_pass rm -f .write_ok
+run_fail touch "\$PRIVATE_DIR/blocked"
+run_fail touch /etc/agent_scope_smoke_denied
+run_fail touch /root/agent_scope_smoke_denied
+run_fail touch /usr/local/bin/agent_scope_smoke_denied
+run_fail chown root:root .
+
+if command -v mount >/dev/null 2>&1; then
+  run_pass mkdir .agent_scope_selfbind
+  run_fail mount --bind . .agent_scope_selfbind
+  run_pass rmdir .agent_scope_selfbind
+else
+  pass 'mount is not installed for the agent session'
+fi
+EOF
+
+chmod 755 "$TOOL_BIN_DIR/codex"
+
+printf 'manual smoke test payload\n' >"$SOURCE_DIR/README"
+chown "$MAIN_USER:$MAIN_GROUP" "$SOURCE_DIR/README"
+
+read -r SOURCE_HASH _ <<<"$(printf '%s' "$SOURCE_DIR" | sha256sum)"
+SOURCE_HASH="${SOURCE_HASH:0:12}"
+MOUNTPOINT_DIR="$BASE_ROOT/codex/$(basename -- "$SOURCE_DIR")-$SOURCE_HASH"
+
+echo "Running smoke test against $AGENT_SCOPE_SCRIPT"
+AGENT_SCOPE_RUNTIME_BIN="$TOOL_BIN_DIR/codex" "$AGENT_SCOPE_SCRIPT" \
+  -u "$MAIN_USER" \
+  -a "$AGENT_USER" \
+  -b "$BASE_ROOT" \
+  -t codex \
+  -s "$SOURCE_DIR"
+
+[[ -f "$RESULTS_FILE" ]] || { echo "Smoke test did not produce a results file" >&2; exit 1; }
+
+echo "In-session checks:"
+cat "$RESULTS_FILE"
+
+if grep -q $'^FAIL\t' "$RESULTS_FILE"; then
+  echo "At least one in-session check failed" >&2
+  exit 1
+fi
+
+if getfacl -R -p "$SOURCE_DIR" | grep -F "user:$AGENT_USER:" >/dev/null 2>&1; then
+  echo "Agent ACL entries were not restored after the session" >&2
+  exit 1
+fi
+
+if ! mountpoint -q "$MOUNTPOINT_DIR"; then
+  echo "Managed bind mount was removed after the session" >&2
+  exit 1
+fi
+
+if sudo -u "$AGENT_USER" touch "$SOURCE_DIR/.post_session_write" >/dev/null 2>&1; then
+  echo "Agent can still write to the source tree after cleanup" >&2
+  exit 1
+fi
+
+if [[ -e "$PRIVATE_DIR/blocked" ]]; then
+  echo "Private directory was modified by the agent" >&2
+  exit 1
+fi
+
+echo
+echo "Post-session checks:"
+echo "PASS  ACLs restored"
+echo "PASS  bind mount kept for resume"
+echo "PASS  agent lost write access after the session"
+echo "PASS  private directory remained unchanged"
+echo
+  echo "Smoke test passed."
+if [[ "$KEEP_ARTIFACTS" == "true" ]]; then
+  echo "Artifacts kept at: $WORK_ROOT"
+  echo "Manual cleanup: printf 'y\\n' | $AGENT_SCOPE_SCRIPT -b $BASE_ROOT -t codex -r"
+fi
