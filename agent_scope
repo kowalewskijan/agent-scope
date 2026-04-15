@@ -15,7 +15,7 @@ set -euo pipefail
 # - Installation support is currently implemented for the "codex" tool.
 # - Runtime tool selection via -t is generic and falls back to PATH if needed.
 
-MAIN_USER="${USER:-user}"
+MAIN_USER="${SUDO_USER:-${USER:-user}}"
 AGENT_USER="agent"
 BASE_ROOT="/srv/work"
 TOOL_NAME="codex"
@@ -24,6 +24,7 @@ SOURCE_DIR=""
 NO_RUN="false"
 RESET_STATE="false"
 DISCONNECT_MOUNT="false"
+PERSIST_ACL="true"
 AGENT_CREATED_BY_SCRIPT="false"
 
 CLI_MAIN_USER=""
@@ -33,6 +34,7 @@ CLI_TOOL_NAME=""
 CLI_INSTALL_TARGET=""
 CLI_SOURCE_DIR=""
 CLI_RESUME_SESSION=""
+CLI_PERSIST_ACL="false"
 
 BASE_DIR=""
 CONFIG_DIR=""
@@ -40,8 +42,26 @@ CONFIG_FILE=""
 ACL_BACKUP=""
 MOUNTPOINT_DIR=""
 AGENT_HOME=""
+AGENT_CODEX_HOME=""
 RESUME_SESSION=""
 REUSE_EXISTING_MOUNT="false"
+SOURCE_HASH=""
+ACL_STATE_DIR=""
+ACL_STATE_FILE=""
+ACL_STATE_BACKUP=""
+ACL_STATE_SOURCE_DIR=""
+ACL_STATE_MOUNTPOINT_DIR=""
+ACL_STATE_MAIN_USER=""
+ACL_STATE_AGENT_USER=""
+ACL_STATE_BACKUP_FILE=""
+ACL_STATE_ACTIVE="false"
+ACL_STATE_LAST_PREPARE_SECONDS=""
+ACL_STATE_LAST_SESSION_ID=""
+ACL_LAST_PREPARE_SECONDS=""
+ACL_REUSED_STATE="false"
+KEEP_ACL_ON_EXIT="false"
+LARGE_REPO_PREPARE_SECONDS_THRESHOLD=10
+LAST_SESSION_ID=""
 
 usage() {
   cat <<EOF
@@ -49,12 +69,13 @@ Usage: sudo $0 [options]
 
 Options:
   -s <source_dir>    Source directory to expose and run the managed tool in
-  -u <main_user>     Main user who should retain access (default: \$USER)
+  -u <main_user>     Main user who should retain access (default: \$SUDO_USER, else \$USER)
   -a <agent_user>    Agent account name to manage (default: $AGENT_USER)
   -b <work_root>     Managed work root (default: $BASE_ROOT); tool state lives in <work_root>/<tool>
   -t <tool>          Runtime tool to execute (default: $TOOL_NAME)
   -i <tool>          Install a supported tool into /opt/<tool> (supported: codex, claude)
   -e <session_id>    Resume a prior interactive session by invoking <tool> resume <session_id>
+  -p                 Keep source ACLs and backup metadata after exit so later runs can reuse them (default)
   -n                 Prepare only; do not expose source or run the tool
   -r                 Reset interactively: unmount, purge the selected tool state, remove managed users
   -d                 Interactively select and unmount one current bind mount under <work_root>
@@ -65,6 +86,7 @@ Examples:
   sudo $0 -i claude
   sudo $0 -s /home/alice/projects/repo -t codex
   sudo $0 -s /home/alice/projects/repo -t codex -e 019d86eb-446f-7361-956b-aac6c08e5163
+  sudo $0 -s /home/alice/projects/repo -t codex -p
   sudo $0 -d
   sudo $0 -b /srv/work -t codex -r
 EOF
@@ -136,6 +158,133 @@ save_config() {
   mv -f "$tmp_config" "$CONFIG_FILE"
 }
 
+source_hash_for() {
+  local path="$1"
+  local path_hash
+
+  read -r path_hash _ <<<"$(printf '%s' "$path" | sha256sum)"
+  printf '%s\n' "${path_hash:0:12}"
+}
+
+reset_acl_state_record() {
+  ACL_STATE_SOURCE_DIR=""
+  ACL_STATE_MOUNTPOINT_DIR=""
+  ACL_STATE_MAIN_USER=""
+  ACL_STATE_AGENT_USER=""
+  ACL_STATE_BACKUP_FILE=""
+  ACL_STATE_ACTIVE="false"
+  ACL_STATE_LAST_PREPARE_SECONDS=""
+  ACL_STATE_LAST_SESSION_ID=""
+}
+
+prepare_acl_state_paths() {
+  [[ -n "$SOURCE_DIR" ]] || return 0
+
+  SOURCE_HASH="$(source_hash_for "$SOURCE_DIR")"
+  ACL_STATE_DIR="$CONFIG_DIR/acl"
+  ACL_STATE_FILE="$ACL_STATE_DIR/$SOURCE_HASH.conf"
+  ACL_STATE_BACKUP="$ACL_STATE_DIR/$SOURCE_HASH.acl"
+}
+
+load_acl_state_record() {
+  local key value
+
+  reset_acl_state_record
+  [[ -f "$ACL_STATE_FILE" ]] || return 0
+
+  while IFS=$'\t' read -r key value; do
+    [[ -n "$key" ]] || continue
+
+    case "$key" in
+      source_dir) ACL_STATE_SOURCE_DIR="$value" ;;
+      mountpoint_dir) ACL_STATE_MOUNTPOINT_DIR="$value" ;;
+      main_user) ACL_STATE_MAIN_USER="$value" ;;
+      agent_user) ACL_STATE_AGENT_USER="$value" ;;
+      backup_file) ACL_STATE_BACKUP_FILE="$value" ;;
+      acl_active) ACL_STATE_ACTIVE="$value" ;;
+      last_prepare_seconds) ACL_STATE_LAST_PREPARE_SECONDS="$value" ;;
+      last_session_id) ACL_STATE_LAST_SESSION_ID="$value" ;;
+    esac
+  done <"$ACL_STATE_FILE"
+}
+
+save_acl_state_record() {
+  local active="$1"
+  local backup_file="$2"
+  local last_prepare_seconds="$3"
+  local last_session_id="$4"
+  local tmp_state
+
+  [[ -n "$ACL_STATE_FILE" ]] || return 0
+
+  for value in "$SOURCE_DIR" "$MOUNTPOINT_DIR" "$MAIN_USER" "$AGENT_USER" "$backup_file" "$last_prepare_seconds" "$last_session_id"; do
+    config_value_is_safe "$value" || { echo "Unsafe ACL state value" >&2; exit 1; }
+  done
+
+  mkdir -p "$ACL_STATE_DIR"
+  chmod 700 "$ACL_STATE_DIR"
+
+  tmp_state="$(mktemp "$ACL_STATE_DIR/acl_state.XXXXXX")"
+  {
+    printf 'source_dir\t%s\n' "$SOURCE_DIR"
+    printf 'mountpoint_dir\t%s\n' "$MOUNTPOINT_DIR"
+    printf 'main_user\t%s\n' "$MAIN_USER"
+    printf 'agent_user\t%s\n' "$AGENT_USER"
+    printf 'backup_file\t%s\n' "$backup_file"
+    printf 'acl_active\t%s\n' "$active"
+    printf 'last_prepare_seconds\t%s\n' "$last_prepare_seconds"
+    printf 'last_session_id\t%s\n' "$last_session_id"
+  } >"$tmp_state"
+
+  chmod 600 "$tmp_state"
+  mv -f "$tmp_state" "$ACL_STATE_FILE"
+}
+
+acl_state_is_reusable() {
+  [[ "$ACL_STATE_ACTIVE" == "true" ]] ||
+    return 1
+  [[ "$ACL_STATE_SOURCE_DIR" == "$SOURCE_DIR" ]] ||
+    return 1
+  [[ "$ACL_STATE_MOUNTPOINT_DIR" == "$MOUNTPOINT_DIR" ]] ||
+    return 1
+  [[ "$ACL_STATE_MAIN_USER" == "$MAIN_USER" ]] ||
+    return 1
+  [[ "$ACL_STATE_AGENT_USER" == "$AGENT_USER" ]] ||
+    return 1
+  [[ -n "$ACL_STATE_BACKUP_FILE" && -f "$ACL_STATE_BACKUP_FILE" ]]
+}
+
+report_acl_prepare_notice() {
+  if [[ "$ACL_STATE_LAST_PREPARE_SECONDS" =~ ^[0-9]+$ ]] &&
+    ((ACL_STATE_LAST_PREPARE_SECONDS >= LARGE_REPO_PREPARE_SECONDS_THRESHOLD)); then
+    printf 'Preparing ACLs for %s; the last run on this tree took about %ss, so startup may take a while.\n' \
+      "$SOURCE_DIR" "$ACL_STATE_LAST_PREPARE_SECONDS" >&2
+    return 0
+  fi
+
+  printf 'Preparing ACLs for %s; this can take a while on large source trees.\n' "$SOURCE_DIR" >&2
+}
+
+latest_codex_session_id() {
+  local latest_session
+
+  [[ "$TOOL_NAME" == "codex" && -d "$AGENT_CODEX_HOME/sessions" ]] || return 1
+
+  latest_session="$(find "$AGENT_CODEX_HOME/sessions" -type f -name 'rollout-*.jsonl' -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -n 1 | awk '{print $2}')"
+  [[ -n "$latest_session" ]] || return 1
+
+  latest_session="${latest_session#rollout-}"
+  latest_session="${latest_session%.jsonl}"
+  printf '%s\n' "${latest_session##*-}"
+}
+
+codex_session_exists() {
+  local session_id="$1"
+
+  [[ "$TOOL_NAME" == "codex" && -n "$session_id" && -d "$AGENT_CODEX_HOME/sessions" ]] || return 1
+  find "$AGENT_CODEX_HOME/sessions" -type f -name "rollout-*-${session_id}.jsonl" -print -quit 2>/dev/null | grep -q .
+}
+
 supported_install_target() {
   case "$1" in
     codex|claude) return 0 ;;
@@ -187,9 +336,17 @@ run_managed_tool() {
   case "$TOOL_NAME" in
     codex)
       if [[ -n "$RESUME_SESSION" ]]; then
-        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2" resume "$3"' -- "$workdir" "$runtime_bin" "$RESUME_SESSION"
+        if [[ -n "$ACL_STATE_LAST_SESSION_ID" && "$RESUME_SESSION" == "$ACL_STATE_LAST_SESSION_ID" ]]; then
+          printf 'Resuming the most recent saved Codex session for %s.\n' "$SOURCE_DIR" >&2
+          sudo -H -u "$AGENT_USER" env HOME="$AGENT_HOME" CODEX_HOME="$AGENT_CODEX_HOME" /bin/bash -lc 'cd -- "$1" && exec "$2" resume --all --last' -- "$workdir" "$runtime_bin"
+        elif codex_session_exists "$RESUME_SESSION"; then
+          sudo -H -u "$AGENT_USER" env HOME="$AGENT_HOME" CODEX_HOME="$AGENT_CODEX_HOME" /bin/bash -lc 'cd -- "$1" && exec "$2" resume --all "$3"' -- "$workdir" "$runtime_bin" "$RESUME_SESSION"
+        else
+          printf 'Saved Codex session %s was not found under %s; resuming the most recent saved session instead.\n' "$RESUME_SESSION" "$AGENT_CODEX_HOME" >&2
+          sudo -H -u "$AGENT_USER" env HOME="$AGENT_HOME" CODEX_HOME="$AGENT_CODEX_HOME" /bin/bash -lc 'cd -- "$1" && exec "$2" resume --all --last' -- "$workdir" "$runtime_bin"
+        fi
       else
-        sudo -H -u "$AGENT_USER" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$workdir" "$runtime_bin"
+        sudo -H -u "$AGENT_USER" env HOME="$AGENT_HOME" CODEX_HOME="$AGENT_CODEX_HOME" /bin/bash -lc 'cd -- "$1" && exec "$2"' -- "$workdir" "$runtime_bin"
       fi
       ;;
     claude)
@@ -265,12 +422,30 @@ ensure_agent_can_traverse() {
 
 cleanup() {
   local status=$?
+  local restore_status=0
 
   trap - EXIT
 
-  if [[ -n "$ACL_BACKUP" && -f "$ACL_BACKUP" && -d "${SOURCE_DIR:-}" ]]; then
-    restore_acl_state "$ACL_BACKUP" "$SOURCE_DIR" || echo "Warning: failed to restore ACLs for $SOURCE_DIR" >&2
-    rm -f "$ACL_BACKUP"
+  LAST_SESSION_ID="$(latest_codex_session_id || true)"
+
+  if [[ -n "$ACL_BACKUP" && -d "${SOURCE_DIR:-}" ]]; then
+    if [[ "$KEEP_ACL_ON_EXIT" == "true" ]]; then
+      save_acl_state_record "true" "$ACL_BACKUP" "$ACL_LAST_PREPARE_SECONDS" "$LAST_SESSION_ID"
+      printf 'Keeping ACLs for %s and managed mount %s for faster resume.\n' "$SOURCE_DIR" "$MOUNTPOINT_DIR" >&2
+    elif [[ -f "$ACL_BACKUP" ]]; then
+      restore_acl_state "$ACL_BACKUP" "$SOURCE_DIR" "$AGENT_USER" "$MAIN_USER" || restore_status=$?
+      if ((restore_status == 0)); then
+        rm -f "$ACL_BACKUP"
+        save_acl_state_record "false" "" "$ACL_LAST_PREPARE_SECONDS" "$LAST_SESSION_ID"
+      else
+        echo "Warning: failed to restore ACLs for $SOURCE_DIR" >&2
+        if [[ "$ACL_BACKUP" == "$ACL_STATE_BACKUP" ]]; then
+          save_acl_state_record "true" "$ACL_BACKUP" "$ACL_LAST_PREPARE_SECONDS" "$LAST_SESSION_ID"
+        fi
+      fi
+    else
+      save_acl_state_record "false" "" "$ACL_LAST_PREPARE_SECONDS" "$LAST_SESSION_ID"
+    fi
   fi
 
   exit "$status"
@@ -278,19 +453,23 @@ cleanup() {
 
 strip_temporary_acl_entries() {
   local path="$1"
+  local agent_user="$2"
+  local main_user="$3"
 
-  setfacl -x "u:${AGENT_USER}" "$path" >/dev/null 2>&1 || true
-  setfacl -x "u:${MAIN_USER}" "$path" >/dev/null 2>&1 || true
+  setfacl -x "u:${agent_user}" "$path" >/dev/null 2>&1 || true
+  setfacl -x "u:${main_user}" "$path" >/dev/null 2>&1 || true
 
   if [[ -d "$path" ]]; then
-    setfacl -x "d:u:${AGENT_USER}" "$path" >/dev/null 2>&1 || true
-    setfacl -x "d:u:${MAIN_USER}" "$path" >/dev/null 2>&1 || true
+    setfacl -x "d:u:${agent_user}" "$path" >/dev/null 2>&1 || true
+    setfacl -x "d:u:${main_user}" "$path" >/dev/null 2>&1 || true
   fi
 }
 
 restore_acl_state() {
   local backup_file="$1"
   local root="$2"
+  local agent_user="$3"
+  local main_user="$4"
   local line path
   local restore_status=0
   declare -A backed_up_paths=()
@@ -305,10 +484,151 @@ restore_acl_state() {
 
   while IFS= read -r path; do
     [[ -n "${backed_up_paths["$path"]+x}" ]] && continue
-    strip_temporary_acl_entries "$path"
+    strip_temporary_acl_entries "$path" "$agent_user" "$main_user"
   done < <(find "$root" -print)
 
   return "$restore_status"
+}
+
+restore_saved_acl_state_for_source() {
+  local source="$1"
+  local saved_source_dir="$SOURCE_DIR"
+  local saved_mountpoint_dir="$MOUNTPOINT_DIR"
+  local saved_main_user="$MAIN_USER"
+  local saved_agent_user="$AGENT_USER"
+  local saved_acl_last_prepare_seconds="$ACL_LAST_PREPARE_SECONDS"
+  local saved_file="$ACL_STATE_FILE"
+  local saved_backup="$ACL_STATE_BACKUP"
+  local saved_source_hash="$SOURCE_HASH"
+  local saved_state_dir="$ACL_STATE_DIR"
+  local restore_status=0
+
+  [[ -n "$source" && -d "$source" ]] || return 0
+
+  SOURCE_DIR="$source"
+  prepare_acl_state_paths
+  load_acl_state_record
+
+  if [[ "$ACL_STATE_ACTIVE" == "true" ]] && [[ "$ACL_STATE_SOURCE_DIR" == "$SOURCE_DIR" ]]; then
+    if [[ -n "$ACL_STATE_BACKUP_FILE" && -f "$ACL_STATE_BACKUP_FILE" ]]; then
+      restore_acl_state "$ACL_STATE_BACKUP_FILE" "$SOURCE_DIR" "$ACL_STATE_AGENT_USER" "$ACL_STATE_MAIN_USER" || restore_status=$?
+      if ((restore_status == 0)); then
+        rm -f "$ACL_STATE_BACKUP_FILE"
+        MOUNTPOINT_DIR="$ACL_STATE_MOUNTPOINT_DIR"
+        MAIN_USER="$ACL_STATE_MAIN_USER"
+        AGENT_USER="$ACL_STATE_AGENT_USER"
+        ACL_LAST_PREPARE_SECONDS="${ACL_STATE_LAST_PREPARE_SECONDS:-}"
+        save_acl_state_record "false" "" "$ACL_LAST_PREPARE_SECONDS" "${ACL_STATE_LAST_SESSION_ID:-}"
+      else
+        printf 'Warning: failed to restore persisted ACLs for %s\n' "$SOURCE_DIR" >&2
+      fi
+    else
+      printf 'Warning: missing persisted ACL backup for %s; clearing active ACL metadata.\n' "$SOURCE_DIR" >&2
+      MOUNTPOINT_DIR="$ACL_STATE_MOUNTPOINT_DIR"
+      MAIN_USER="$ACL_STATE_MAIN_USER"
+      AGENT_USER="$ACL_STATE_AGENT_USER"
+      ACL_LAST_PREPARE_SECONDS="${ACL_STATE_LAST_PREPARE_SECONDS:-}"
+      save_acl_state_record "false" "" "$ACL_LAST_PREPARE_SECONDS" "${ACL_STATE_LAST_SESSION_ID:-}"
+    fi
+  fi
+
+  SOURCE_HASH="$saved_source_hash"
+  SOURCE_DIR="$saved_source_dir"
+  MOUNTPOINT_DIR="$saved_mountpoint_dir"
+  MAIN_USER="$saved_main_user"
+  AGENT_USER="$saved_agent_user"
+  ACL_LAST_PREPARE_SECONDS="$saved_acl_last_prepare_seconds"
+  ACL_STATE_DIR="$saved_state_dir"
+  ACL_STATE_FILE="$saved_file"
+  ACL_STATE_BACKUP="$saved_backup"
+  load_acl_state_record
+
+  return "$restore_status"
+}
+
+restore_all_saved_acl_states() {
+  local state_file source
+
+  [[ -d "$ACL_STATE_DIR" ]] || return 0
+
+  while IFS= read -r state_file; do
+    [[ -n "$state_file" ]] || continue
+    source=""
+
+    reset_acl_state_record
+    while IFS=$'\t' read -r key value; do
+      [[ -n "$key" ]] || continue
+      case "$key" in
+        source_dir) source="$value" ;;
+        acl_active) ACL_STATE_ACTIVE="$value" ;;
+      esac
+    done <"$state_file"
+
+    if [[ "$ACL_STATE_ACTIVE" == "true" ]] && [[ -n "$source" ]]; then
+      restore_saved_acl_state_for_source "$source" || return $?
+    fi
+  done < <(find "$ACL_STATE_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.conf' | sort)
+}
+
+source_dir_for_mountpoint() {
+  local mountpoint="$1"
+  local state_file source saved_mountpoint
+
+  [[ -n "$mountpoint" && -d "$ACL_STATE_DIR" ]] || return 1
+
+  while IFS= read -r state_file; do
+    [[ -n "$state_file" ]] || continue
+    source=""
+    saved_mountpoint=""
+
+    while IFS=$'\t' read -r key value; do
+      [[ -n "$key" ]] || continue
+      case "$key" in
+        source_dir) source="$value" ;;
+        mountpoint_dir) saved_mountpoint="$value" ;;
+      esac
+    done <"$state_file"
+
+    if [[ "$saved_mountpoint" == "$mountpoint" && -n "$source" ]]; then
+      printf '%s\n' "$source"
+      return 0
+    fi
+  done < <(find "$ACL_STATE_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.conf' | sort)
+
+  return 1
+}
+
+load_active_acl_state_candidates() {
+  local state_file source saved_mountpoint acl_active
+
+  ACTIVE_STATE_MOUNTPOINTS=()
+  ACTIVE_STATE_SOURCES=()
+
+  [[ -d "$ACL_STATE_DIR" ]] || return 0
+
+  while IFS= read -r state_file; do
+    [[ -n "$state_file" ]] || continue
+    source=""
+    saved_mountpoint=""
+    acl_active=""
+
+    while IFS=$'\t' read -r key value; do
+      [[ -n "$key" ]] || continue
+      case "$key" in
+        source_dir) source="$value" ;;
+        mountpoint_dir) saved_mountpoint="$value" ;;
+        acl_active) acl_active="$value" ;;
+      esac
+    done <"$state_file"
+
+    [[ "$acl_active" == "true" ]] || continue
+    [[ -n "$saved_mountpoint" && -n "$source" ]] || continue
+    [[ -d "$saved_mountpoint" ]] || continue
+    mountpoint -q "$saved_mountpoint" 2>/dev/null || continue
+
+    ACTIVE_STATE_MOUNTPOINTS+=("$saved_mountpoint")
+    ACTIVE_STATE_SOURCES+=("$source")
+  done < <(find "$ACL_STATE_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.conf' | sort)
 }
 
 collect_mount_targets() {
@@ -335,7 +655,7 @@ collect_mount_targets() {
 
 load_bound_mounts() {
   local root="$1"
-  local target source
+  local target source display_source
 
   BOUND_TARGETS=()
   BOUND_SOURCES=()
@@ -343,14 +663,16 @@ load_bound_mounts() {
   collect_mount_targets "$root" asc
   for target in "${COLLECTED_MOUNT_TARGETS[@]}"; do
     source="$(findmnt -n -o SOURCE --target "$target" 2>/dev/null || true)"
+    display_source="$(source_dir_for_mountpoint "$target" || true)"
+    [[ -n "$display_source" ]] || display_source="$source"
     BOUND_TARGETS+=("$target")
-    BOUND_SOURCES+=("$source")
+    BOUND_SOURCES+=("$display_source")
   done
 }
 
 disconnect_mount_interactive() {
   local selection=0
-  local key seq target
+  local key seq target source tty_state
 
   [[ -t 0 && -t 1 ]] || {
     echo "Option -d requires an interactive terminal" >&2
@@ -363,10 +685,15 @@ disconnect_mount_interactive() {
     exit 0
   fi
 
+  tty_state="$(stty -g)"
+  trap 'stty "$tty_state" >/dev/null 2>&1 || true' RETURN
+  stty -echo -icanon min 1 time 0
+
   while true; do
     printf '\033[H\033[J'
     printf 'Managed bind mounts under %s\n' "$BASE_ROOT"
-    printf 'Use arrow keys to choose, Enter to unmount, Esc to exit.\n\n'
+    printf 'Use arrow keys to choose, Enter to close the session completely, Esc to exit.\n'
+    printf 'Closing a session restores ACLs before unmounting and can take a while on large trees.\n\n'
 
     for i in "${!BOUND_TARGETS[@]}"; do
       if [[ "$i" -eq "$selection" ]]; then
@@ -376,25 +703,44 @@ disconnect_mount_interactive() {
       fi
     done
 
-    IFS= read -rsn1 key
+    IFS= read -rsn1 key || true
     case "$key" in
       $'\x1b')
-        if IFS= read -rsn1 -t 0.05 seq && [[ "$seq" == "[" ]]; then
-          IFS= read -rsn1 seq
+        seq=""
+        if IFS= read -rsn1 -t 0.2 seq; then
           case "$seq" in
-            A) ((selection > 0)) && ((selection--)) ;;
-            B) ((selection < ${#BOUND_TARGETS[@]} - 1)) && ((selection++)) ;;
+            "["|O)
+              if IFS= read -rsn1 -t 0.2 seq; then
+                case "$seq" in
+                  A) ((selection > 0)) && ((selection--)) ;;
+                  B) ((selection < ${#BOUND_TARGETS[@]} - 1)) && ((selection++)) ;;
+                esac
+              fi
+              ;;
+            *)
+              stty "$tty_state" >/dev/null 2>&1 || true
+              printf '\033[H\033[J'
+              exit 0
+              ;;
           esac
         else
+          stty "$tty_state" >/dev/null 2>&1 || true
           printf '\033[H\033[J'
           exit 0
         fi
         ;;
-      "")
+      ""|$'\r'|$'\n')
         target="${BOUND_TARGETS[$selection]}"
+        source="$(source_dir_for_mountpoint "$target" || true)"
+        stty "$tty_state" >/dev/null 2>&1 || true
+        printf '\033[H\033[J'
+        if [[ -n "$source" ]]; then
+          printf 'Closing managed session for %s.\n' "$source" >&2
+          printf 'Restoring ACLs before unmounting %s; this can take as long as initial ACL preparation on large trees.\n' "$target" >&2
+          restore_saved_acl_state_for_source "$source"
+        fi
         umount "$target"
         rmdir "$target" >/dev/null 2>&1 || true
-        printf '\033[H\033[J'
         printf 'Unmounted %s\n' "$target"
         exit 0
         ;;
@@ -403,6 +749,21 @@ disconnect_mount_interactive() {
 }
 
 choose_existing_mount_for_resume() {
+  load_active_acl_state_candidates
+
+  case "${#ACTIVE_STATE_MOUNTPOINTS[@]}" in
+    1)
+      MOUNTPOINT_DIR="${ACTIVE_STATE_MOUNTPOINTS[0]}"
+      SOURCE_DIR="${ACTIVE_STATE_SOURCES[0]}"
+      REUSE_EXISTING_MOUNT="true"
+      return 0
+      ;;
+    [2-9]*)
+      echo "Multiple managed bind mounts found under $BASE_DIR; pass -s <source_dir> to choose one" >&2
+      exit 2
+      ;;
+  esac
+
   load_bound_mounts "$BASE_DIR"
 
   case "${#BOUND_TARGETS[@]}" in
@@ -412,7 +773,8 @@ choose_existing_mount_for_resume() {
       ;;
     1)
       MOUNTPOINT_DIR="${BOUND_TARGETS[0]}"
-      SOURCE_DIR="$MOUNTPOINT_DIR"
+      SOURCE_DIR="$(source_dir_for_mountpoint "$MOUNTPOINT_DIR" || true)"
+      [[ -n "$SOURCE_DIR" ]] || SOURCE_DIR="$MOUNTPOINT_DIR"
       REUSE_EXISTING_MOUNT="true"
       ;;
     *)
@@ -437,9 +799,10 @@ purge_state() {
   local -a mount_targets=()
   local -a remaining_mounts=()
   local -a directories=()
+  local -a acl_restore_sources=()
   local -a users=()
   local -a groups=()
-  local target
+  local target state_file source
 
   if [[ -d "$BASE_DIR" ]]; then
     collect_mount_targets "$BASE_DIR" desc
@@ -447,6 +810,23 @@ purge_state() {
       mount_targets+=("$target")
     done
     directories+=("$BASE_DIR")
+  fi
+
+  if [[ -d "$ACL_STATE_DIR" ]]; then
+    while IFS= read -r state_file; do
+      source=""
+      [[ -n "$state_file" ]] || continue
+
+      while IFS=$'\t' read -r key value; do
+        [[ -n "$key" ]] || continue
+        case "$key" in
+          source_dir) source="$value" ;;
+          acl_active) [[ "$value" == "true" ]] || source="" ;;
+        esac
+      done <"$state_file"
+
+      [[ -n "$source" ]] && acl_restore_sources+=("$source")
+    done < <(find "$ACL_STATE_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.conf' | sort)
   fi
 
   if [[ "$AGENT_CREATED_BY_SCRIPT" == "true" ]] && id -u "$AGENT_USER" >/dev/null 2>&1; then
@@ -472,6 +852,13 @@ purge_state() {
     printf '  Directories to remove: none\n'
   fi
 
+  if ((${#acl_restore_sources[@]} > 0)); then
+    printf '  Source trees whose persisted ACLs will be restored:\n'
+    printf '    %s\n' "${acl_restore_sources[@]}"
+  else
+    printf '  Source trees whose persisted ACLs will be restored: none\n'
+  fi
+
   if ((${#users[@]} > 0)); then
     printf '  Users to delete:\n'
     printf '    %s\n' "${users[@]}"
@@ -491,6 +878,8 @@ purge_state() {
     y|Y) ;;
     *) echo "Aborted."; exit 0 ;;
   esac
+
+  restore_all_saved_acl_states
 
   if ((${#mount_targets[@]} > 0)); then
     for target in "${mount_targets[@]}"; do
@@ -543,7 +932,7 @@ purge_state() {
   fi
 }
 
-while getopts ":s:u:a:b:t:i:e:nrdh" opt; do
+while getopts ":s:u:a:b:t:i:e:pnrdh" opt; do
   case "$opt" in
     s) CLI_SOURCE_DIR="$OPTARG" ;;
     u) CLI_MAIN_USER="$OPTARG" ;;
@@ -552,6 +941,7 @@ while getopts ":s:u:a:b:t:i:e:nrdh" opt; do
     t) CLI_TOOL_NAME="$OPTARG" ;;
     i) CLI_INSTALL_TARGET="$OPTARG" ;;
     e) CLI_RESUME_SESSION="$OPTARG" ;;
+    p) CLI_PERSIST_ACL="true" ;;
     n) NO_RUN="true" ;;
     r) RESET_STATE="true" ;;
     d) DISCONNECT_MOUNT="true" ;;
@@ -602,6 +992,7 @@ BASE_ROOT="$(normalize_path "$BASE_ROOT" m)"
 BASE_DIR="$BASE_ROOT/$TOOL_NAME"
 CONFIG_DIR="$BASE_DIR/.config"
 CONFIG_FILE="$CONFIG_DIR/agent_scope.conf"
+ACL_STATE_DIR="$CONFIG_DIR/acl"
 
 load_config
 
@@ -609,6 +1000,7 @@ load_config
 [[ -n "$CLI_AGENT_USER" ]] && AGENT_USER="$CLI_AGENT_USER"
 [[ -n "$CLI_SOURCE_DIR" ]] && SOURCE_DIR="$CLI_SOURCE_DIR"
 [[ -n "$CLI_RESUME_SESSION" ]] && RESUME_SESSION="$CLI_RESUME_SESSION"
+[[ "$CLI_PERSIST_ACL" == "true" ]] && PERSIST_ACL="true"
 if [[ -n "$CLI_INSTALL_TARGET" ]]; then
   INSTALL_TARGET="$CLI_INSTALL_TARGET"
 fi
@@ -658,6 +1050,11 @@ if [[ -d "$AGENT_HOME" ]]; then
   chmod 700 "$AGENT_HOME"
 fi
 
+AGENT_CODEX_HOME="$AGENT_HOME/.codex"
+mkdir -p "$AGENT_CODEX_HOME"
+chown "$AGENT_USER:$AGENT_USER" "$AGENT_CODEX_HOME"
+chmod 700 "$AGENT_CODEX_HOME"
+
 gpasswd -d "$AGENT_USER" sudo >/dev/null 2>&1 || true
 gpasswd -d "$AGENT_USER" wheel >/dev/null 2>&1 || true
 
@@ -673,9 +1070,15 @@ elif tool_name_is_safe "$TOOL_NAME"; then
   ensure_tool_symlink "$TOOL_NAME"
 fi
 
+RUNTIME_BIN=""
+if [[ "$NO_RUN" != "true" && ( -n "$SOURCE_DIR" || -n "$RESUME_SESSION" ) ]]; then
+  RUNTIME_BIN="$(tool_runtime_bin)"
+fi
+
 if [[ -z "$SOURCE_DIR" || "$NO_RUN" == "true" ]]; then
   if [[ -n "$RESUME_SESSION" && "$NO_RUN" != "true" ]]; then
     choose_existing_mount_for_resume
+    SOURCE_DIR="$(normalize_path "$SOURCE_DIR" e)"
   else
     exit 0
   fi
@@ -689,10 +1092,10 @@ fi
 
 trap cleanup EXIT
 
+prepare_acl_state_paths
+
 if [[ "$REUSE_EXISTING_MOUNT" != "true" ]]; then
   NAME="$(basename -- "$SOURCE_DIR")"
-  read -r SOURCE_HASH _ <<<"$(printf '%s' "$SOURCE_DIR" | sha256sum)"
-  SOURCE_HASH="${SOURCE_HASH:0:12}"
   MOUNTPOINT_DIR="$BASE_DIR/$NAME-$SOURCE_HASH"
 fi
 
@@ -716,12 +1119,46 @@ else
   exit 1
 fi
 
-ACL_BACKUP="$(mktemp /tmp/agent_scope.acl.XXXXXX)"
-getfacl -R -p "$SOURCE_DIR" >"$ACL_BACKUP"
+load_acl_state_record
+ACL_LAST_PREPARE_SECONDS="${ACL_STATE_LAST_PREPARE_SECONDS:-}"
+KEEP_ACL_ON_EXIT="$PERSIST_ACL"
 
-setfacl -R -m "u:${AGENT_USER}:rwX,u:${MAIN_USER}:rwX" "$SOURCE_DIR"
-setfacl -R -m "d:u:${AGENT_USER}:rwX,d:u:${MAIN_USER}:rwX" "$SOURCE_DIR"
+if [[ "$ACL_STATE_ACTIVE" == "true" ]] && ! acl_state_is_reusable; then
+  printf 'Restoring existing persisted ACLs for %s before applying a new ACL state.\n' "$SOURCE_DIR" >&2
+  restore_saved_acl_state_for_source "$SOURCE_DIR"
+  load_acl_state_record
+  ACL_LAST_PREPARE_SECONDS="${ACL_STATE_LAST_PREPARE_SECONDS:-$ACL_LAST_PREPARE_SECONDS}"
+fi
 
-RUNTIME_BIN="$(tool_runtime_bin)"
+if acl_state_is_reusable; then
+  ACL_BACKUP="$ACL_STATE_BACKUP_FILE"
+  ACL_REUSED_STATE="true"
+  printf 'Reusing persisted ACLs for %s.\n' "$SOURCE_DIR" >&2
+else
+  local_acl_prepare_started=$SECONDS
+  report_acl_prepare_notice
+
+  if [[ "$PERSIST_ACL" == "true" ]]; then
+    ACL_BACKUP_TMP=""
+    mkdir -p "$ACL_STATE_DIR"
+    chmod 700 "$ACL_STATE_DIR"
+    ACL_BACKUP_TMP="$(mktemp "$ACL_STATE_DIR/acl_backup.XXXXXX")"
+    getfacl -R -p "$SOURCE_DIR" >"$ACL_BACKUP_TMP"
+    mv -f "$ACL_BACKUP_TMP" "$ACL_STATE_BACKUP"
+    ACL_BACKUP="$ACL_STATE_BACKUP"
+  else
+    ACL_BACKUP="$(mktemp /tmp/agent_scope.acl.XXXXXX)"
+    getfacl -R -p "$SOURCE_DIR" >"$ACL_BACKUP"
+  fi
+
+  setfacl -R -m "u:${AGENT_USER}:rwX,u:${MAIN_USER}:rwX,d:u:${AGENT_USER}:rwX,d:u:${MAIN_USER}:rwX" "$SOURCE_DIR"
+
+  ACL_LAST_PREPARE_SECONDS="$((SECONDS - local_acl_prepare_started))"
+  save_acl_state_record "false" "" "$ACL_LAST_PREPARE_SECONDS" "${ACL_STATE_LAST_SESSION_ID:-}"
+  if [[ "$ACL_LAST_PREPARE_SECONDS" =~ ^[0-9]+$ ]] && ((ACL_LAST_PREPARE_SECONDS > 0)); then
+    printf 'ACL preparation for %s finished in %ss.\n' "$SOURCE_DIR" "$ACL_LAST_PREPARE_SECONDS" >&2
+  fi
+fi
+
 ensure_agent_can_traverse "$MOUNTPOINT_DIR"
 run_managed_tool "$RUNTIME_BIN" "$MOUNTPOINT_DIR"

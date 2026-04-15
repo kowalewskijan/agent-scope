@@ -46,6 +46,12 @@ Run Codex on a source tree:
 sudo ./agent_scope -s /home/alice/projects/repo -t codex
 ```
 
+Keep ACLs in place after exit so later launches can reuse them:
+
+```bash
+sudo ./agent_scope -s /home/alice/projects/repo -t codex -p
+```
+
 Run Claude Code on a source tree:
 
 ```bash
@@ -85,11 +91,14 @@ sudo ./agent_scope -t codex -r
 ## Notes
 
 - Run `agent_scope` as root, typically with `sudo`.
-- By default, `-u` uses `$USER` and `-a` defaults to `agent`.
+- By default, `-u` uses `$SUDO_USER` when available, otherwise `$USER`; `-a` defaults to `agent`.
 - Managed state is stored under `/srv/work/<tool>`.
 - Tool installs go to `/opt/<tool>`.
-- Normal exit restores ACLs but keeps the bind mount, so a later resume can reuse it.
-- `-r` and `-d` are the paths that unmount managed directories.
+- For Codex, persistent CLI state is stored under the managed agent home at `~agent/.codex`, not inside the source tree.
+- Normal exit keeps both the bind mount and ACL grant, so later runs can reuse them without repeating the recursive ACL setup.
+- By default, `agent_scope` keeps the ACL backup and active ACL grant in place so later runs can skip the recursive ACL work; use `-d` or `-r` to restore and clean up persisted ACL state.
+- `-p` is kept as an explicit no-op for that default behavior.
+- `-d` and `-r` close managed sessions completely: they restore ACLs first and then unmount/remove managed directories, so they can take a while on very large source trees.
 
 ## Smoke Test
 
